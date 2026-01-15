@@ -30,8 +30,6 @@ This repository currently serves as a **research and design reference**, with fu
 
 ## Contents
 
-## Repository Structure
-
 - `paper/`  
   LaTeX source files for the accompanying research paper, including the main manuscript, bibliography, and figures used in the final results.
 
