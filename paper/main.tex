@@ -1,0 +1,604 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage[numbers]{natbib}
+\geometry{margin=1in}
+
+\begin{document}
+
+\title{Counterparty Credit Risk Exposure Simulation \\ \large Monte Carlo IMM-Style Framework with Hull--White and Credit-Spread GBM}
+\author{}
+\date{}
+\maketitle
+
+\section{High-Level Objective}
+
+The goal of this project is to build a Monte Carlo simulation framework for \emph{counterparty credit risk} (CCR) on a portfolio consisting of:
+\begin{itemize}[leftmargin=*]
+    \item Corporate bonds, and
+    \item Plain-vanilla interest rate swaps.
+\end{itemize}
+
+The framework:
+\begin{itemize}[leftmargin=*]
+    \item Models the risk-free interest-rate dynamics via the one-factor Hull--White short-rate model,
+    \item Models credit spreads via a geometric Brownian motion (GBM),
+    \item Simulates joint paths of risk factors,
+    \item Revalues instruments along each simulated path,
+    \item Computes exposure profiles: Expected Exposure (EE) and Potential Future Exposure (PFE),
+    \item Aggregates these profiles into Credit Valuation Adjustment (CVA),
+    \item Is implemented efficiently in Python and SQL in a style consistent with an Internal Models Method (IMM) engine under Basel III/IV.
+\end{itemize}
+
+The following sections describe the steps in a logically ordered and mathematically explicit way.
+
+\section{Phase 0: Problem Setup and Notation}
+
+\subsection{Portfolio and Counterparty Setup}
+
+We consider a portfolio of \( N_{\text{inst}} \) instruments, indexed by \( j = 1, \dots, N_{\text{inst}} \). Each instrument is either:
+\begin{itemize}[leftmargin=*]
+    \item a corporate bond, or
+    \item a plain-vanilla interest-rate swap (IRS).
+\end{itemize}
+
+All instruments are assumed to be traded with a given counterparty \( \mathcal{C} \). For simplicity, we can start with a single counterparty, and later generalize to multiple counterparties and \emph{netting sets}.
+
+We denote:
+\begin{itemize}[leftmargin=*]
+    \item \( V_t \): risk-free mark-to-market (MtM) of the portfolio at time \( t \),
+    \item \( V_t^{(j)} \): risk-free MtM of instrument \( j \) at time \( t \),
+    \item \( V_t = \sum_{j=1}^{N_{\text{inst}}} V_t^{(j)} \).
+\end{itemize}
+
+\subsection{Counterparty Credit Exposure}
+
+The \emph{exposure} at time \( t \) is defined as the positive part of the MtM:
+\begin{equation}
+    \text{Exposure}(t) := V_t^{+} := \max(V_t, 0).
+\end{equation}
+
+Under a given probability measure (typically risk-neutral, \( \mathbb{Q} \)), the \emph{Expected Exposure (EE)} at time \( t \) is:
+\begin{equation}
+    EE(t) := \mathbb{E}^{\mathbb{Q}}\big[ V_t^{+} \big].
+\end{equation}
+
+The \emph{Potential Future Exposure (PFE)} at confidence level \( \alpha \in (0,1) \) at time \( t \) is the \( \alpha \)-quantile of the exposure distribution:
+\begin{equation}
+    PFE_{\alpha}(t) := \inf \big\{ x \in \mathbb{R} : \mathbb{P}\big( V_t^{+} \le x \big) \ge \alpha \big\}.
+\end{equation}
+
+We will compute \( EE(t_k) \) and \( PFE_{\alpha}(t_k) \) at a discrete time grid \( 0 = t_0 < t_1 < \dots < t_K = T_{\max} \).
+
+\section{Phase 1: Data Acquisition (WRDS and SQL)}
+
+\subsection{Market Data from WRDS}
+
+On a given valuation date \( t_0 = 0 \), we retrieve from WRDS:
+\begin{itemize}[leftmargin=*]
+    \item A set of Treasury yields across maturities \( \{ T_i^{\text{Treas}} \}_{i=1}^{n_T} \),
+    \item A set of vanilla swap par rates across maturities \( \{ T_j^{\text{swap}} \}_{j=1}^{n_S} \),
+    \item A set of credit spreads for corporate bonds or credit indices across maturities \( \{ T_k^{\text{credit}} \}_{k=1}^{n_C} \).
+\end{itemize}
+
+For example:
+\[
+\text{Treasury data: } \big( T_i^{\text{Treas}}, y_i^{\text{Treas}} \big)_{i=1}^{n_T}, \quad
+\text{Swap data: } \big( T_j^{\text{swap}}, R_j^{\text{swap}} \big)_{j=1}^{n_S},
+\]
+\[
+\text{Credit spreads: } \big( T_k^{\text{credit}}, s_k^{\text{credit}} \big)_{k=1}^{n_C}.
+\]
+
+\subsection{SQL Storage and Preprocessing}
+
+We store this data in relational tables, for example:
+\begin{itemize}[leftmargin=*]
+    \item \verb|treasury_yields_raw(date, tenor, yield)|
+    \item \verb|swap_rates_raw(date, tenor, swap_rate)|
+    \item \verb|credit_spreads_raw(date, issuer, rating, tenor, spread)|
+\end{itemize}
+
+Preprocessing steps include:
+\begin{enumerate}[leftmargin=*]
+    \item Filtering data for the specific valuation date,
+    \item Handling missing quotes and outliers,
+    \item Aligning day-count conventions and business-day calendars.
+\end{enumerate}
+
+In practice, SQL is used to:
+\begin{itemize}[leftmargin=*]
+    \item Join and filter tables,
+    \item Aggregate or average multiple quotes,
+    \item Export clean, aligned data into Python for curve construction and calibration.
+\end{itemize}
+
+\section{Phase 2: Yield Curve Construction and Bootstrapping}
+
+\subsection{Discount Factors and Zero-Coupon Yields}
+
+We denote the discount factor at time 0 for maturity \( T \) by \( P(0,T) \). Given a continuously compounded zero rate \( y(0,T) \), we have:
+\begin{equation}
+    P(0,T) = e^{-y(0,T) \, T}.
+\end{equation}
+
+Conversely, given \( P(0,T) \), the continuous zero rate is:
+\begin{equation}
+    y(0,T) = -\frac{1}{T} \ln P(0,T).
+\end{equation}
+
+\subsection{Bootstrapping from Coupon-Bearing Instruments}
+
+We use Treasury coupon bonds and/or interest-rate swaps to bootstrap \( P(0,T) \) at a set of maturities. Consider, for instance, a fixed-coupon bond with:
+
+\begin{itemize}[leftmargin=*]
+    \item Coupon rate \( c \) (annualized),
+    \item Maturity \( T_n \),
+    \item Payment dates \( 0 < T_1 < T_2 < \dots < T_n = T_n \),
+    \item Year fractions \( \Delta_i = T_i - T_{i-1} \) (with \( T_0 := 0 \)),
+    \item Observed market price \( B_0 \).
+\end{itemize}
+
+Assuming deterministic discount factors \( P(0,T_i) \), the pricing equation is:
+\begin{equation}
+    B_0 = \sum_{i=1}^{n} c \Delta_i P(0,T_i) + P(0,T_n).
+\end{equation}
+
+If earlier discount factors \( P(0,T_1), \dots, P(0,T_{n-1}) \) are already known from shorter-maturity instruments, one can solve linearly for \( P(0,T_n) \).
+
+Similarly, for a par vanilla swap with:
+\begin{itemize}[leftmargin=*]
+    \item Fixed rate \( K \) (observed par swap rate),
+    \item Payment dates \( 0 < T_1 < \dots < T_m = T^{\text{swap}} \),
+    \item Same discount factors \( P(0,T_i) \),
+\end{itemize}
+the par condition (at inception, net PV zero) implies:
+\begin{equation}
+    \text{PV}_{\text{fixed}}(0) = \text{PV}_{\text{float}}(0).
+\end{equation}
+
+Assuming the PV of the floating leg can be written in terms of discount factors (e.g., as \( P(0, T_0) - P(0, T_m) \) for an idealized case), we have:
+\begin{equation}
+    K \sum_{i=1}^{m} \Delta_i P(0,T_i) = 1 - P(0,T_m),
+\end{equation}
+from which \( P(0,T_m) \) or \( K \) can be inferred, depending on which is unknown.
+
+Using the observed par swap rates \( \{ R_j^{\text{swap}} \} \), we bootstrap additional discount factors for longer maturities.
+
+\subsection{Spline Interpolation for a Smooth Term Structure}
+
+Once we have discount factors at a discrete set of maturities \( \{ T_{\ell} \}_{\ell=1}^{L} \), we apply spline interpolation to obtain a continuous function \( T \mapsto P(0,T) \).
+
+Conceptually, we choose a spline (e.g., cubic spline) \( S(T) \) such that:
+\begin{equation}
+    S(T_{\ell}) = P(0,T_{\ell}), \quad \ell = 1,\dots,L,
+\end{equation}
+and enforce smoothness conditions:
+\begin{equation}
+    S'(T_{\ell}^-) = S'(T_{\ell}^+), \quad S''(T_{\ell}^-) = S''(T_{\ell}^+),
+\end{equation}
+at the interior knots.
+
+This yields a smooth, approximately arbitrage-free term structure from which we can evaluate:
+\begin{equation}
+    P(0,T) \quad \text{and} \quad y(0,T)
+\end{equation}
+for any maturity \( T \) needed for the simulation or pricing.
+
+\section{Phase 3: Interest-Rate Model Specification (Hull--White)}
+
+\subsection{Short-Rate Dynamics}
+
+We model the instantaneous short rate \( r_t \) under the risk-neutral measure \( \mathbb{Q} \) using the one-factor Hull--White model:
+\begin{equation}
+    dr_t = a \big( \theta(t) - r_t \big) \, dt + \sigma \, dW_t,
+\end{equation}
+where:
+\begin{itemize}[leftmargin=*]
+    \item \( a > 0 \) is the mean-reversion speed,
+    \item \( \sigma > 0 \) is the volatility parameter,
+    \item \( \theta(t) \) is a deterministic function chosen to fit the initial yield curve,
+    \item \( W_t \) is a standard Brownian motion under \( \mathbb{Q} \).
+\end{itemize}
+
+\subsection{Bond Pricing in Hull--White}
+
+Given the Hull--White model, the price at time \( t \) of a zero-coupon bond maturing at time \( T \) can be written as:
+\begin{equation}
+    P(t,T) = A(t,T) \, e^{-B(t,T) r_t},
+\end{equation}
+where \( A(t,T) \) and \( B(t,T) \) are known analytical functions of \( a,\sigma \) and the initial yield curve.
+
+For example, in the basic Hull--White specification,
+\begin{equation}
+    B(t,T) = \frac{1 - e^{-a (T-t)}}{a}.
+\end{equation}
+
+The function \( \theta(t) \) is chosen such that the model-implied bond prices \( P^{\text{HW}}(0,T) \) match the bootstrapped discount factors \( P(0,T) \) from market data:
+\begin{equation}
+    P^{\text{HW}}(0,T) = P(0,T), \quad \forall T \text{ in a grid of maturities.}
+\end{equation}
+
+This condition determines \( \theta(t) \) in terms of the initial term structure and the parameters \( a \) and \( \sigma \).
+
+\section{Phase 4: Calibration of Hull--White to the Swaption Surface}
+
+\subsection{Swaption Market Data}
+
+We collect from the market a set of swaption implied volatilities:
+\[
+\big\{ \sigma^{\text{mkt}}_{\text{swptn}}(T_{\text{opt}}^{(i)}, T_{\text{swap}}^{(i)}) \big\}_{i=1}^{N_{\text{swptn}}},
+\]
+where:
+\begin{itemize}[leftmargin=*]
+    \item \( T_{\text{opt}}^{(i)} \) is the option maturity,
+    \item \( T_{\text{swap}}^{(i)} \) is the underlying swap tenor,
+    \item \( \sigma^{\text{mkt}}_{\text{swptn}} \) is the Black implied vol.
+\end{itemize}
+
+\subsection{Model-Implied Swaption Prices}
+
+For a given parameter pair \( (a,\sigma) \), and the corresponding \( \theta(t) \) determined from the initial curve, we can compute model-implied swaption prices and implied volatilities
+\[
+\sigma^{\text{HW}}_{\text{swptn}}(T_{\text{opt}}^{(i)}, T_{\text{swap}}^{(i)}; a, \sigma).
+\]
+
+\subsection{Calibration Objective}
+
+We define a calibration error function, for example a sum of squared differences:
+\begin{equation}
+    \mathcal{E}(a,\sigma) 
+    := \sum_{i=1}^{N_{\text{swptn}}} w_i \left( 
+        \sigma^{\text{HW}}_{\text{swptn}}(T_{\text{opt}}^{(i)}, T_{\text{swap}}^{(i)}; a, \sigma)
+        - \sigma^{\text{mkt}}_{\text{swptn}}(T_{\text{opt}}^{(i)}, T_{\text{swap}}^{(i)})
+    \right)^2,
+\end{equation}
+where \( w_i \ge 0 \) are weights (possibly equal or liquidity-based).
+
+The calibrated parameters \( (a^\ast, \sigma^\ast) \) solve:
+\begin{equation}
+    (a^\ast, \sigma^\ast) = \arg\min_{a>0, \, \sigma>0} \mathcal{E}(a,\sigma).
+\end{equation}
+
+Once \( a^\ast \) and \( \sigma^\ast \) are found, we recompute \( \theta(t) \) so that the model still matches the initial yield curve.
+
+\section{Phase 5: Credit Spread Dynamics via GBM}
+
+\subsection{GBM Specification for Credit Spreads}
+
+Let \( s_t \) represent the credit spread of a given issuer (or credit index) at time \( t \). Under a chosen measure (e.g., risk-neutral or historical), we model \( s_t \) as a geometric Brownian motion (GBM):
+\begin{equation}
+    ds_t = \mu_s \, s_t \, dt + \sigma_s \, s_t \, dZ_t,
+\end{equation}
+where:
+\begin{itemize}[leftmargin=*]
+    \item \( \mu_s \) is the drift parameter,
+    \item \( \sigma_s > 0 \) is the volatility parameter,
+    \item \( Z_t \) is a Brownian motion (possibly correlated with \( W_t \) from the interest-rate model).
+\end{itemize}
+
+The solution to this SDE is:
+\begin{equation}
+    s_t = s_0 \exp\left( \left(\mu_s - \frac{1}{2} \sigma_s^2\right) t + \sigma_s Z_t \right),
+\end{equation}
+ensuring \( s_t > 0 \) almost surely.
+
+\subsection{Estimation / Calibration of Spread Parameters}
+
+We estimate \( \mu_s \) and \( \sigma_s \) from historical time series of spreads:
+\[
+\{ s_{t_n}^{\text{hist}} \}_{n=0}^{N_{\text{hist}}}.
+\]
+
+For small time steps \( \Delta t \), approximate log-returns:
+\begin{equation}
+    \Delta \ln s_{t_n} := \ln s_{t_n} - \ln s_{t_{n-1}} \approx 
+    \left(\mu_s - \tfrac{1}{2}\sigma_s^2 \right) \Delta t + \sigma_s \sqrt{\Delta t} \, \varepsilon_n,
+\end{equation}
+where \( \varepsilon_n \sim \mathcal{N}(0,1) \).
+
+Then:
+\begin{align}
+    \hat{\mu}_s - \tfrac{1}{2}\hat{\sigma}_s^2 &\approx \frac{1}{N_{\text{hist}} \Delta t} \sum_{n=1}^{N_{\text{hist}}} \Delta \ln s_{t_n}, \\
+    \hat{\sigma}_s^2 &\approx \frac{1}{(N_{\text{hist}}-1)\Delta t} \sum_{n=1}^{N_{\text{hist}}} 
+    \big( \Delta \ln s_{t_n} - \overline{\Delta \ln s} \big)^2,
+\end{align}
+where \( \overline{\Delta \ln s} \) is the sample mean of log-returns.
+
+\subsection{Mapping Spreads to Default Probabilities (Optional)}
+
+Given a credit spread \( s_t \) and an assumed recovery rate \( R \in (0,1) \), a rough approximation to a \emph{hazard rate} (default intensity) \( \lambda_t \) is:
+\begin{equation}
+    s_t \approx (1 - R) \lambda_t,
+\end{equation}
+or equivalently:
+\begin{equation}
+    \lambda_t \approx \frac{s_t}{1 - R}.
+\end{equation}
+
+Then, under the assumption of a piecewise-constant hazard rate, the survival probability to time \( T \) is:
+\begin{equation}
+    Q(0,T) = \exp\left( - \int_0^T \lambda_u \, du \right).
+\end{equation}
+
+This mapping is useful when computing CVA later.
+
+\section{Phase 6: Monte Carlo Simulation of Risk-Factor Paths}
+
+\subsection{Time Discretization}
+
+We choose a time grid:
+\begin{equation}
+    0 = t_0 < t_1 < \dots < t_K = T_{\max},
+\end{equation}
+with uniform time step \( \Delta t = t_{k} - t_{k-1} \) for simplicity (e.g., monthly or quarterly).
+
+We simulate \( N_{\text{paths}} \) independent paths indexed by \( i = 1,\dots,N_{\text{paths}} \).
+
+\subsection{Discretization of the Hull--White Short Rate}
+
+For each path \( i \), we generate short-rate values \( r_{t_k}^{(i)} \). A standard Euler discretization scheme is:
+\begin{equation}
+    r_{t_{k+1}}^{(i)} = r_{t_k}^{(i)} + a \big( \theta(t_k) - r_{t_k}^{(i)} \big) \Delta t 
+    + \sigma \sqrt{\Delta t} \, \varepsilon_{k}^{(i)},
+\end{equation}
+where \( \varepsilon_{k}^{(i)} \sim \mathcal{N}(0,1) \) i.i.d.
+
+Alternatively, one can use the exact solution of the Ornstein--Uhlenbeck process, which reduces discretization error:
+\begin{equation}
+    r_{t_{k+1}}^{(i)} = r_{t_k}^{(i)} e^{-a \Delta t} 
+    + \theta_{\text{eff}}(t_k, \Delta t) 
+    + \sigma \sqrt{\frac{1 - e^{-2a\Delta t}}{2a}} \, \varepsilon_{k}^{(i)},
+\end{equation}
+where \( \theta_{\text{eff}}(t_k, \Delta t) \) is a function of \( \theta(\cdot) \) integrated over the interval \( [t_k, t_{k+1}] \).
+
+\subsection{Discount Factors along Paths}
+
+For each path \( i \), we approximate the accumulated short rate along the path to compute a pathwise discount factor:
+\begin{equation}
+    \int_0^{t_k} r_u^{(i)} du \approx \sum_{m=0}^{k-1} r_{t_m}^{(i)} \Delta t.
+\end{equation}
+
+Then:
+\begin{equation}
+    D^{(i)}(0, t_k) := \exp\left( - \sum_{m=0}^{k-1} r_{t_m}^{(i)} \Delta t \right).
+\end{equation}
+
+These discount factors are used to price instruments along the path.
+
+\subsection{Discretization of Credit Spread GBM}
+
+For the credit spread process \( s_t \), we discretize the GBM solution:
+\begin{equation}
+    s_{t_{k+1}}^{(i)} = s_{t_k}^{(i)} \exp\left( \left(\mu_s - \tfrac{1}{2} \sigma_s^2\right) \Delta t 
+    + \sigma_s \sqrt{\Delta t} \, \xi_{k}^{(i)} \right),
+\end{equation}
+where \( \xi_k^{(i)} \sim \mathcal{N}(0,1) \). We may correlate \( \xi_k^{(i)} \) with \( \varepsilon_k^{(i)} \) if we want interest-rate / credit-spread correlation.
+
+\section{Phase 7: Pathwise Instrument Pricing (MtM Computation)}
+
+\subsection{Corporate Bond Valuation on Each Path}
+
+Consider a corporate bond with:
+\begin{itemize}[leftmargin=*]
+    \item Notional \( N \),
+    \item Coupon rate \( c \),
+    \item Payment dates \( T_{1}^{\text{bond}}, \dots, T_{n}^{\text{bond}} \),
+    \item Recovery rate \( R \),
+    \item Maturity \( T_n^{\text{bond}} \).
+\end{itemize}
+
+At a simulation time \( t_k \) and path \( i \), we compute the time-\( t_k \) price \( V_{t_k}^{\text{bond}, (i)} \) as the discounted expectation of remaining cashflows, potentially adjusted for default via hazard rates derived from \( s_t^{(i)} \). A simplified risky-bond approximation is:
+\begin{equation}
+    V_{t_k}^{\text{bond}, (i)} 
+    \approx \sum_{j: T_j^{\text{bond}} > t_k} c N \Delta_j \, D^{(i)}(t_k, T_j^{\text{bond}}) Q^{(i)}(t_k, T_j^{\text{bond}}) 
+    + N D^{(i)}(t_k, T_n^{\text{bond}}) Q^{(i)}(t_k, T_n^{\text{bond}}),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=*]
+    \item \( D^{(i)}(t_k, T_j^{\text{bond}}) := D^{(i)}(0, T_j^{\text{bond}}) / D^{(i)}(0, t_k) \),
+    \item \( Q^{(i)}(t_k, T_j^{\text{bond}}) \) is the survival probability from \( t_k \) to \( T_j^{\text{bond}} \), derived from the simulated hazard rates.
+\end{itemize}
+
+In a simplified setup (for a coursework project), we may treat the bond as default-free and only discount with the simulated risk-free discount factors, in which case:
+\begin{equation}
+    V_{t_k}^{\text{bond}, (i)} 
+    \approx \sum_{j: T_j^{\text{bond}} > t_k} c N \Delta_j \, D^{(i)}(t_k, T_j^{\text{bond}}) 
+    + N D^{(i)}(t_k, T_n^{\text{bond}}).
+\end{equation}
+
+\subsection{Interest-Rate Swap Valuation}
+
+For a plain-vanilla swap with:
+\begin{itemize}[leftmargin=*]
+    \item Notional \( N \),
+    \item Fixed rate \( K \),
+    \item Payment dates \( T_1^{\text{swap}}, \dots, T_m^{\text{swap}} \),
+    \item Floating rate index (e.g., LIBOR, SOFR) linked to the short-rate process.
+\end{itemize}
+
+At time \( t_k \), path \( i \), the swap value is:
+\begin{equation}
+    V_{t_k}^{\text{swap}, (i)} = PV_{\text{float}}^{(i)}(t_k) - PV_{\text{fixed}}^{(i)}(t_k),
+\end{equation}
+for a receive-float, pay-fixed swap (sign convention may vary).
+
+The fixed leg PV is:
+\begin{equation}
+    PV_{\text{fixed}}^{(i)}(t_k) = N K \sum_{j: T_j^{\text{swap}} > t_k} \Delta_j \, D^{(i)}(t_k, T_j^{\text{swap}}).
+\end{equation}
+
+The floating leg PV depends on expectations of future floating rates under the simulated rate paths. In the Hull--White framework, it can be computed by using the pathwise discount factors and forward-rate relationships. In a simulation-based approximation, one often uses the fact that, in the risk-neutral measure, the PV of the floating leg can be written in terms of discount factors alone; for example, in a simple setting:
+\begin{equation}
+    PV_{\text{float}}^{(i)}(t_k) \approx N \big( 1 - D^{(i)}(t_k, T_m^{\text{swap}}) \big),
+\end{equation}
+although more detailed implementations will use actual forward rates extracted from the simulated short rate.
+
+\subsection{Portfolio MtM and Exposure}
+
+For each path \( i \) and time \( t_k \), the portfolio MtM is:
+\begin{equation}
+    V_{t_k}^{(i)} = \sum_{j=1}^{N_{\text{inst}}} V_{t_k}^{(j),(i)}.
+\end{equation}
+
+The exposure on that path at that time is:
+\begin{equation}
+    \text{Exposure}^{(i)}(t_k) = \max\big( V_{t_k}^{(i)}, 0 \big).
+\end{equation}
+
+If we incorporate netting and collateral agreements (CSA), we would first aggregate instruments by netting set and then reduce exposures by collateral, thresholds, and minimum transfer amounts. For simplicity, we can ignore collateral in the initial version.
+
+\section{Phase 8: EE and PFE Computation from Monte Carlo Paths}
+
+\subsection{Expected Exposure}
+
+Given \( N_{\text{paths}} \) scenarios, the Monte Carlo estimator of the Expected Exposure at time \( t_k \) is:
+\begin{equation}
+    \widehat{EE}(t_k) = \frac{1}{N_{\text{paths}}} \sum_{i=1}^{N_{\text{paths}}} \text{Exposure}^{(i)}(t_k).
+\end{equation}
+
+\subsection{Potential Future Exposure}
+
+To compute the PFE at confidence level \( \alpha \in (0,1) \), we:
+\begin{enumerate}[leftmargin=*]
+    \item Collect all exposure values \( \text{Exposure}^{(i)}(t_k) \) across paths \( i=1,\dots,N_{\text{paths}} \),
+    \item Sort them in ascending order:
+    \[
+        \text{Exposure}^{(i_1)}(t_k) \le \dots \le \text{Exposure}^{(i_{N_{\text{paths}}})}(t_k),
+    \]
+    \item Take the empirical \( \alpha \)-quantile, i.e., the element at index approximately \( \lceil \alpha N_{\text{paths}} \rceil \).
+\end{enumerate}
+
+Formally, the estimator is:
+\begin{equation}
+    \widehat{PFE}_{\alpha}(t_k) := \text{empirical quantile of } 
+    \big\{ \text{Exposure}^{(i)}(t_k) \big\}_{i=1}^{N_{\text{paths}}} \text{ at level } \alpha.
+\end{equation}
+
+In your implementation, you compute \( \widehat{PFE}_{0.95}(t_k) \) and \( \widehat{PFE}_{0.99}(t_k) \) to capture 95\% and 99\% tail exposures.
+
+\section{Phase 9: CVA Computation from EE and Default Probabilities}
+
+\subsection{Default Probability Term Structure}
+
+From the initial or simulated credit spread term structure, using a hazard-rate approximation, we derive:
+\begin{itemize}[leftmargin=*]
+    \item Survival probabilities \( Q(0,t) \),
+    \item Default probabilities \( PD(0,t) = 1 - Q(0,t) \),
+\end{itemize}
+for a grid of maturities \( t_1, \dots, t_K \).
+
+For a piecewise-constant hazard rate \( \lambda_k \) on \([t_{k-1}, t_k)\), we have:
+\begin{equation}
+    Q(0, t_k) = \exp\left( - \sum_{\ell=1}^k \lambda_{\ell} (t_{\ell} - t_{\ell-1}) \right).
+\end{equation}
+Then:
+\begin{equation}
+    \Delta PD(t_k) = PD(0,t_k) - PD(0,t_{k-1}) = Q(0, t_{k-1}) - Q(0,t_k).
+\end{equation}
+
+\subsection{CVA Formula}
+
+Let \( R \) denote the recovery rate (e.g., 40\%). The continuous-time definition of unilateral CVA is:
+\begin{equation}
+    \text{CVA} = (1 - R) \int_0^T D(0,t) \, EE(t) \, dPD(t),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=*]
+    \item \( D(0,t) \) is the risk-free discount factor,
+    \item \( EE(t) \) is the expected exposure profile,
+    \item \( PD(t) \) is the cumulative default probability.
+\end{itemize}
+
+On the discrete grid \( \{t_k\}_{k=1}^K \), we approximate the integral as a sum:
+\begin{equation}
+    \widehat{\text{CVA}} = (1 - R) \sum_{k=1}^{K} D(0, t_k) \, \widehat{EE}(t_k) \, \Delta PD(t_k).
+\end{equation}
+
+This yields a CVA estimate for the counterparty under the simulated exposure and default profiles.
+
+\section{Phase 10: Historical Stress Scenarios (2008, 2020)}
+
+\subsection{Definition of Stress Shocks}
+
+To assess the robustness of the exposure and CVA under stressed conditions, we construct \emph{historical stress scenarios} based on crises such as:
+\begin{itemize}[leftmargin=*]
+    \item The 2008 Global Financial Crisis,
+    \item The 2020 COVID-19 shock.
+\end{itemize}
+
+For each crisis period, we identify:
+\begin{itemize}[leftmargin=*]
+    \item Shifts and twists in the yield curve: \( \Delta y_{\text{stress}}(T) \),
+    \item Changes in spread levels \( \Delta s_{\text{stress}}(T) \),
+    \item Changes in vol parameters \( \Delta \sigma, \Delta \sigma_s \).
+\end{itemize}
+
+\subsection{Re-Running the Simulation under Stress}
+
+We incorporate stress by modifying the initial conditions and/or parameters:
+\begin{itemize}[leftmargin=*]
+    \item Replace \( y(0,T) \) with \( y_{\text{stress}}(0,T) = y(0,T) + \Delta y_{\text{stress}}(T) \),
+    \item Replace initial spreads \( s_0 \) with \( s_{0,\text{stress}} = s_0 + \Delta s_{\text{stress}} \),
+    \item Adjust volatilities to \( \sigma_{\text{stress}}, \sigma_{s,\text{stress}} \).
+\end{itemize}
+
+We then repeat the steps:
+\begin{enumerate}[leftmargin=*]
+    \item Re-bootstrap the stressed yield curve,
+    \item Re-calibrate (or re-specify) the Hull--White parameters (if needed),
+    \item Re-simulate risk-factor paths,
+    \item Re-compute \( EE(t_k) \), \( PFE_{\alpha}(t_k) \), and CVA.
+\end{enumerate}
+
+Comparing baseline and stress results gives insight into tail behavior and sensitivity to extreme market moves.
+
+\section{Phase 11: Implementation Efficiency and Model Risk (SR 11-7 Alignment)}
+
+\subsection{Python Vectorization and SQL Pipelines}
+
+To handle thousands of instruments and \( N_{\text{paths}} \) Monte Carlo scenarios, we:
+\begin{itemize}[leftmargin=*]
+    \item Use NumPy arrays for simulating \( r_{t_k}^{(i)} \), \( s_{t_k}^{(i)} \), and valuations,
+    \item Store risk-factor paths in matrix form, e.g.\ arrays of shape \( (N_{\text{paths}}, K+1) \),
+    \item Avoid Python loops in inner computations, relying on vectorized operations,
+    \item Use SQL queries to pre-aggregate and filter the large WRDS data sets before passing compact tables to Python.
+\end{itemize}
+
+\subsection{Model Risk Management Principles (SR 11-7)}
+
+In line with SR 11-7 guidance on model risk, the framework is designed with:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Conceptual soundness:} standard, well-documented models (Hull--White, GBM, hazard-rate approximations),
+    \item \textbf{Ongoing monitoring:} the ability to compare model outputs (EE, PFE, CVA) under different dates and stress periods,
+    \item \textbf{Outcomes analysis and backtesting:} potential to compare simulated exposures with realized P\&L or historical crisis behavior,
+    \item \textbf{Documentation and governance:} clear, step-by-step documentation of data sources, calibration methods, assumptions, and limitations.
+\end{itemize}
+
+\section{Summary of the Overall Step-by-Step Pipeline}
+
+For clarity, we summarize the steps in compact form:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Data acquisition:} Pull Treasury yields, swap rates, and credit spreads from WRDS; store in SQL.
+    \item \textbf{Curve construction:} Bootstrap discount factors from coupon instruments and swaps; smooth via spline interpolation.
+    \item \textbf{Interest-rate model:} Specify the one-factor Hull--White short-rate model; determine \( \theta(t) \) to fit the initial curve.
+    \item \textbf{Hull--White calibration:} Calibrate \( a, \sigma \) to the swaption implied volatility surface.
+    \item \textbf{Credit-spread model:} Model credit spreads with GBM; estimate \( \mu_s, \sigma_s \) from historical data.
+    \item \textbf{Monte Carlo simulation:} Simulate paths of \( r_t \) and \( s_t \) on a discrete time grid; derive pathwise discount factors and hazard rates.
+    \item \textbf{Instrument pricing:} For each path and time, compute NtM for corporate bonds and swaps, then portfolio MtM.
+    \item \textbf{Exposure profiles:} Take positive part of MtM to get exposure per path; aggregate to compute \( EE(t_k) \) and \( PFE_{\alpha}(t_k) \).
+    \item \textbf{CVA:} Combine \( EE(t_k) \), discount factors, and default probabilities to compute CVA via discrete summation.
+    \item \textbf{Stress testing:} Repeatedly run the full pipeline under stressed yield-curve and spread configurations (2008, 2020 shocks).
+    \item \textbf{Efficiency and governance:} Implement vectorized code and robust data pipelines; document assumptions and alignment with SR 11-7.
+\end{enumerate}
+
+\bibliographystyle{plain}
+\nocite{*}
+\bibliography{references}
+\end{document}
